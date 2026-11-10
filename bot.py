@@ -1,12 +1,14 @@
 import asyncio
+import io
 import logging
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict
 
+import qrcode
 from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandObject
-from aiogram.types import FSInputFile, Message, TelegramObject
+from aiogram.types import BufferedInputFile, FSInputFile, Message, TelegramObject
 
 import awg
 from config import BOT_TOKEN, ADMIN_USER_ID, PROXY_URL
@@ -17,15 +19,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-# Трекеры для автоочистки: chat_id -> [message_id, ...] / message_id
+# Трекеры для автоочистки
 _sent_messages: Dict[int, list[int]] = {}
 _last_commands: Dict[int, int] = {}
 _chat_locks: Dict[int, asyncio.Lock] = {}
 
 
 class TrackingBot(Bot):
-    """Bot, который запоминает ID своих сообщений для последующей очистки."""
+    """Бот, который запоминает ID своих сообщений (текст, файлы, фото) для очистки."""
 
     async def send_message(self, *args, **kwargs):
         msg = await super().send_message(*args, **kwargs)
@@ -34,6 +35,11 @@ class TrackingBot(Bot):
 
     async def send_document(self, *args, **kwargs):
         msg = await super().send_document(*args, **kwargs)
+        _sent_messages.setdefault(msg.chat.id, []).append(msg.message_id)
+        return msg
+
+    async def send_photo(self, *args, **kwargs):
+        msg = await super().send_photo(*args, **kwargs)
         _sent_messages.setdefault(msg.chat.id, []).append(msg.message_id)
         return msg
 
@@ -56,10 +62,10 @@ class CleanupMiddleware(BaseMiddleware):
     """Перед новой командой удаляет предыдущую команду и все ответы бота."""
 
     async def __call__(
-        self,
-        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
-        event: TelegramObject,
-        data: Dict[str, Any],
+            self,
+            handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+            event: TelegramObject,
+            data: Dict[str, Any],
     ) -> Any:
         if not isinstance(event, Message):
             return await handler(event, data)
@@ -71,14 +77,14 @@ class CleanupMiddleware(BaseMiddleware):
         chat_id = event.chat.id
         lock = _chat_locks.setdefault(chat_id, asyncio.Lock())
         async with lock:
-            # Удаляем ответы бота на предыдущую команду
+            # 1. Удаляем ответы бота на предыдущую команду (текст, файлы, QR)
             for mid in _sent_messages.pop(chat_id, []):
                 try:
                     await event.bot.delete_message(chat_id=chat_id, message_id=mid)
                 except Exception as e:
                     logger.debug("Не удалось удалить сообщение %s: %s", mid, e)
 
-            # Удаляем саму предыдущую команду
+            # 2. Удаляем саму предыдущую команду пользователя
             prev_cmd = _last_commands.pop(chat_id, None)
             if prev_cmd:
                 try:
@@ -86,7 +92,7 @@ class CleanupMiddleware(BaseMiddleware):
                 except Exception as e:
                     logger.debug("Не удалось удалить команду %s: %s", prev_cmd, e)
 
-            # Запоминаем текущую команду
+            # 3. Запоминаем текущую команду
             _last_commands[chat_id] = event.message_id
 
             return await handler(event, data)
@@ -141,9 +147,16 @@ async def cmd_get(message: Message, command: CommandObject):
     if not is_admin(message):
         return
 
-    name = (command.args or "").strip()
-    if not name:
-        await message.answer("Использование: `/get <имя>`", parse_mode="Markdown")
+    args = (command.args or "").split()
+    if not args:
+        await message.answer("Использование: `/get <имя> [qr/conf]`", parse_mode="Markdown")
+        return
+
+    name = args[0]
+    fmt = args[1].lower() if len(args) > 1 else "conf"
+
+    if fmt not in ("conf", "qr"):
+        await message.answer("Неверный формат. Используйте `qr` или `conf`.", parse_mode="Markdown")
         return
 
     ok, result = await awg.get_client(name)
@@ -153,14 +166,30 @@ async def cmd_get(message: Message, command: CommandObject):
 
     conf_path = Path(result)
     try:
-        await message.answer_document(
-            FSInputFile(conf_path, filename=f"{name}.conf"),
-            caption=f"Конфигурация для **{name}**",
-            parse_mode="Markdown",
-        )
+        if fmt == "conf":
+            await message.answer_document(
+                FSInputFile(conf_path, filename=f"{name}.conf"),
+                caption=f"Конфигурация для **{name}**",
+                parse_mode="Markdown",
+            )
+        elif fmt == "qr":
+            # Читаем конфиг и генерируем QR
+            text = conf_path.read_text(errors="replace")
+            qr = qrcode.make(text)
+
+            # Сохраняем в память (без создания временных файлов)
+            img_byte_arr = io.BytesIO()
+            qr.save(img_byte_arr, format='PNG')
+            img_byte_arr.seek(0)
+
+            await message.answer_photo(
+                BufferedInputFile(img_byte_arr.read(), filename=f"{name}.png"),
+                caption=f"QR-код для **{name}**",
+                parse_mode="Markdown",
+            )
     except Exception as e:
-        logger.exception("Не удалось отправить файл")
-        await message.answer(f"Не удалось отправить файл: {e}")
+        logger.exception("Не удалось отправить файл/QR")
+        await message.answer(f"Ошибка при отправке: {e}")
 
 
 @dp.message(Command("delete"))
@@ -188,8 +217,6 @@ async def cmd_list(message: Message):
 
 async def main():
     logger.info("Бот запущен. Администратор: %s", ADMIN_USER_ID)
-    # handle_as_tasks=False гарантирует последовательную обработку,
-    # чтобы автоочистка не гонялась за своими же сообщениями
     await dp.start_polling(bot, handle_as_tasks=False)
 
 
