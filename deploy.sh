@@ -345,10 +345,14 @@ except Exception:
     fi
     if [[ -z "${REALITY_PRIV:-}" ]]; then
         local pair
-        pair="$(xray x25519)" || die "xray x25519 не сработал"
-        REALITY_PRIV="$(awk -F': ' '/Private key/{print $2}' <<< "$pair" | tr -d '[:space:]')"
-        REALITY_PUB="$(awk -F': ' '/Public key/{print $2}' <<< "$pair" | tr -d '[:space:]')"
-        [[ -n "$REALITY_PRIV" && -n "$REALITY_PUB" ]] || die "Не удалось разобрать вывод xray x25519"
+        pair="$(xray x25519)" || die "Команда 'xray x25519' завершилась с ошибкой"
+        # Формат вывода менялся между версиями Xray:
+        #   старый: "Private key: ..." / "Public key: ..."
+        #   новый (26.x): "PrivateKey: ..." / "Password (PublicKey): ..."
+        REALITY_PRIV="$(grep -iE 'private[ _]?key' <<< "$pair" | head -n1 | cut -d: -f2- | tr -d '[:space:]')"
+        REALITY_PUB="$(grep -iE 'public[ _]?key' <<< "$pair" | head -n1 | cut -d: -f2- | tr -d '[:space:]')"
+        [[ -n "$REALITY_PRIV" && -n "$REALITY_PUB" ]] \
+            || die "Не удалось разобрать вывод 'xray x25519': $(head -n 3 <<< "$pair")"
         log "Reality: сгенерирована новая пара ключей"
     fi
     REALITY_SID="${REALITY_SID:-$(openssl rand -hex 8)}"
