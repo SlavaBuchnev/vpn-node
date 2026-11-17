@@ -358,6 +358,17 @@ except Exception:
     REALITY_SID="${REALITY_SID:-$(openssl rand -hex 8)}"
 
     write_xray_config
+    # Официальный юнит Xray запускает процесс от nobody, а конфиг с ключом
+    # Reality закрыт правами 600 (root). Переводим сервис на root — как и
+    # весь остальной стек (awg-bot, awg-quick), — чтобы nobody не нужен
+    # доступ к файлу.
+    install -d /etc/systemd/system/xray.service.d
+    cat > /etc/systemd/system/xray.service.d/override.conf <<'EOF'
+[Service]
+User=root
+Group=root
+EOF
+    systemctl daemon-reload
     systemctl enable --now xray >/dev/null 2>&1 || true
     systemctl restart xray
     sleep 1
@@ -498,8 +509,14 @@ setup_venv() {
 prompt_env() {
     local env_file="${INSTALL_DIR}/.env"
     if [[ -f "$env_file" ]]; then
-        log ".env уже существует — оставляю как есть"
-        return
+        # Бережём существующий файл только если он реально заполнен;
+        # пустой/битый .env = бот не запустится, так что пересоздаём.
+        if grep -qE '^BOT_TOKEN=.+' "$env_file" \
+                && grep -qE '^ADMIN_USER_ID=[0-9]+' "$env_file"; then
+            log ".env уже существует и заполнен — оставляю как есть"
+            return
+        fi
+        warn "${env_file} существует, но без BOT_TOKEN/ADMIN_USER_ID — пересоздаю"
     fi
 
     local token="${BOT_TOKEN:-}" admin="${ADMIN_USER_ID:-}"
@@ -509,8 +526,8 @@ prompt_env() {
     if [[ -z "$admin" && -t 0 ]]; then
         read -r -p "Ваш Telegram ID (узнать у @userinfobot): " admin
     fi
-    [[ -n "$token" ]] || die "BOT_TOKEN не задан"
-    [[ -n "$admin" ]] || die "ADMIN_USER_ID не задан"
+    [[ -n "$token" ]] || die "BOT_TOKEN не задан (запустите интерактивно или передайте BOT_TOKEN=... ADMIN_USER_ID=...)"
+    [[ -n "$admin" ]] || die "ADMIN_USER_ID не задан (запустите интерактивно или передайте BOT_TOKEN=... ADMIN_USER_ID=...)"
 
     umask 077
     cat > "$env_file" <<EOF
@@ -549,8 +566,12 @@ EOF
 }
 
 enable_start_bot() {
-    log "Включаю и запускаю ${SERVICE_NAME}"
-    systemctl enable --now "${SERVICE_NAME}"
+    # enable --now НЕ перезапускает уже работающий сервис: после обновления
+    # файлов процесс бота продолжал бы работать на старом коде. Поэтому
+    # всегда restart.
+    log "Включаю и перезапускаю ${SERVICE_NAME}"
+    systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+    systemctl restart "${SERVICE_NAME}"
     sleep 2
     systemctl --no-pager --lines=15 status "${SERVICE_NAME}" || true
 }
