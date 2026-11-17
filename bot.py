@@ -7,15 +7,21 @@
 в экраны (меню, список клиентов, карточка клиента, состояние сервера)
 с inline-кнопками; конфиги и QR приходят отдельными сообщениями.
 
-Автоочистка чата: при каждом новом сообщении администратора удаляются
-все предыдущие сообщения чата (команды пользователя и ответы бота) —
-в чате остаётся только последний диалог.
+Автоочистка чата:
+- сообщение пользователя удаляется сразу после обработки;
+- «эфемерные» ответы бота (конфиги, QR, ссылки, уведомления) удаляются
+  по таймеру EPHEMERAL_TTL секунд;
+- текущий экран с кнопками живёт, пока его не заменит новый экран,
+  новое сообщение пользователя или таймер у старого экрана.
+Разметка — HTML: имена клиентов и другие данные не могут сломать экраны.
 """
 
 import asyncio
+import html
 import io
 import logging
 import math
+import os
 import re
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict
@@ -47,34 +53,73 @@ NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 LIST_PAGE_SIZE = 8
 AWG_SERVICE = "awg-quick@awg0"
 
+# Через сколько секунд удалять «эфемерные» сообщения бота
+EPHEMERAL_TTL = int(os.getenv("EPHEMERAL_TTL", "120"))
+
 # Эмодзи и описания протоколов для экранов
 TYPE_EMOJI = {"awg": "🛡", "vless": "🚀", "ss": "⚡"}
 TYPE_DESCRIPTIONS = {
-    "awg": "файл `.conf` + QR, приложение AmneziaWG",
-    "vless": "ссылка `vless://` + QR, маскировка под TLS — лучше всего против блокировок",
-    "ss": "ссылка `ss://` + QR, лёгкий и быстрый",
+    "awg": "файл .conf + QR, приложение AmneziaWG",
+    "vless": "ссылка vless:// + QR, маскировка под TLS — лучше всего против блокировок",
+    "ss": "ссылка ss:// + QR, лёгкий и быстрый",
 }
 
-# chat_id -> id сообщений (пользователя и бота), подлежащих удалению
-_chat_messages: Dict[int, set[int]] = {}
+# chat_id -> id «эфемерных» сообщений (удаляются по таймеру и при новом сообщении)
+_chat_ephemeral: Dict[int, set[int]] = {}
+# chat_id -> id текущего экрана с кнопками (живёт, пока не заменён)
+_chat_screens: Dict[int, int] = {}
 _chat_locks: Dict[int, asyncio.Lock] = {}
 
 
-class TrackingBot(Bot):
-    """Бот, запоминающий ID отправленных сообщений для автоочистки чата."""
+def _schedule_ttl_delete(b: Bot, chat_id: int, message_id: int) -> None:
+    """Удаляет сообщение по таймеру EPHEMERAL_TTL секунд."""
 
-    async def _track(self, message: Message) -> Message:
-        _chat_messages.setdefault(message.chat.id, set()).add(message.message_id)
-        return message
+    async def _job() -> None:
+        await asyncio.sleep(EPHEMERAL_TTL)
+        try:
+            await b.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
+        _chat_ephemeral.get(chat_id, set()).discard(message_id)
+
+    asyncio.create_task(_job())
+
+
+class TrackingBot(Bot):
+    """Бот, ведущий учёт своих сообщений для автоочистки чата.
+
+    Сообщение с inline-клавиатурой считается «экраном»: оно становится
+    текущим экраном чата, а предыдущий экран уходит на таймер удаления.
+    Остальные сообщения — «эфемерные»: удаляются по таймеру.
+    """
+
+    def _classify(self, message: Message, markup) -> None:
+        chat_id = message.chat.id
+        is_screen = bool(getattr(markup, "inline_keyboard", None))
+        if is_screen:
+            old = _chat_screens.get(chat_id)
+            _chat_screens[chat_id] = message.message_id
+            if old and old != message.message_id:
+                _chat_ephemeral.setdefault(chat_id, set()).add(old)
+                _schedule_ttl_delete(self, chat_id, old)
+        else:
+            _chat_ephemeral.setdefault(chat_id, set()).add(message.message_id)
+            _schedule_ttl_delete(self, chat_id, message.message_id)
 
     async def send_message(self, *args, **kwargs):
-        return await self._track(await super().send_message(*args, **kwargs))
+        msg = await super().send_message(*args, **kwargs)
+        self._classify(msg, kwargs.get("reply_markup"))
+        return msg
 
     async def send_document(self, *args, **kwargs):
-        return await self._track(await super().send_document(*args, **kwargs))
+        msg = await super().send_document(*args, **kwargs)
+        self._classify(msg, kwargs.get("reply_markup"))
+        return msg
 
     async def send_photo(self, *args, **kwargs):
-        return await self._track(await super().send_photo(*args, **kwargs))
+        msg = await super().send_photo(*args, **kwargs)
+        self._classify(msg, kwargs.get("reply_markup"))
+        return msg
 
 
 def create_bot() -> Bot:
@@ -107,7 +152,8 @@ class AdminMiddleware(BaseMiddleware):
 
 
 class CleanupMiddleware(BaseMiddleware):
-    """При новом сообщении админа удаляет все предыдущие сообщения чата."""
+    """При новом сообщении админа стирает весь предыдущий чат,
+    а само сообщение админа удаляет сразу после обработки."""
 
     async def __call__(
             self,
@@ -120,16 +166,35 @@ class CleanupMiddleware(BaseMiddleware):
         chat_id = event.chat.id
         lock = _chat_locks.setdefault(chat_id, asyncio.Lock())
         async with lock:
-            old = _chat_messages.pop(chat_id, set())
-            for mid in old:
-                if mid == event.message_id:
-                    continue
+            doomed = _chat_ephemeral.pop(chat_id, set())
+            screen = _chat_screens.pop(chat_id, None)
+            if screen:
+                doomed.add(screen)
+            doomed.discard(event.message_id)
+            for mid in doomed:
                 try:
                     await event.bot.delete_message(chat_id=chat_id, message_id=mid)
                 except Exception as exc:
                     logger.debug("Не удалось удалить сообщение %s: %s", mid, exc)
-            _chat_messages.setdefault(chat_id, set()).add(event.message_id)
-        return await handler(event, data)
+
+        result = await handler(event, data)
+
+        # Сообщение пользователя удаляем сразу после обработки; если не
+        # получилось (редко) — останется в эфемерном множестве и будет
+        # удалено при следующем сообщении или по таймеру.
+        _chat_ephemeral.setdefault(chat_id, set()).add(event.message_id)
+
+        async def _delete_soon() -> None:
+            await asyncio.sleep(0.5)  # дать боту ответить
+            try:
+                await event.bot.delete_message(chat_id=chat_id,
+                                               message_id=event.message_id)
+                _chat_ephemeral.get(chat_id, set()).discard(event.message_id)
+            except Exception:
+                _schedule_ttl_delete(event.bot, chat_id, event.message_id)
+
+        asyncio.create_task(_delete_soon())
+        return result
 
 
 dp.message.outer_middleware(AdminMiddleware())
@@ -150,6 +215,10 @@ def fmt_created(ts: int) -> str:
     return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
 
 
+def code(text: str) -> str:
+    return f"<code>{html.escape(text)}</code>"
+
+
 async def safe_edit(message: Message, text: str, **kwargs) -> None:
     try:
         await message.edit_text(text, **kwargs)
@@ -159,8 +228,8 @@ async def safe_edit(message: Message, text: str, **kwargs) -> None:
 
 
 async def service_active(name: str) -> bool:
-    code, _, _ = await run_cmd("systemctl", "is-active", "--quiet", name, timeout=10)
-    return code == 0
+    code_, _, _ = await run_cmd("systemctl", "is-active", "--quiet", name, timeout=10)
+    return code_ == 0
 
 
 def menu_kb() -> InlineKeyboardMarkup:
@@ -181,8 +250,8 @@ async def screen_main() -> tuple[str, InlineKeyboardMarkup]:
     host = get_vpn_host() or "не определён"
     count = len(await storage.all_clients())
     text = (
-        "🏠 **VPN Node**\n\n"
-        f"🌐 Адрес сервера: `{host}`\n"
+        "🏠 <b>VPN Node</b>\n\n"
+        f"🌐 Адрес сервера: {code(host)}\n"
         f"👥 Клиентов: {count}\n\n"
         "Выбирай раздел:"
     )
@@ -210,14 +279,15 @@ async def screen_list(page: int) -> tuple[str, InlineKeyboardMarkup]:
         except Exception:
             logger.exception("Ошибка сбора статистики %s", backend.key)
 
-    lines = [f"📋 **Клиенты ({total})**", ""]
+    lines = [f"📋 <b>Клиенты ({total})</b>", ""]
     rows = []
     for name in shown:
         info = clients[name]
         backend = BACKENDS.get(info.get("type"))
         label = backend.label if backend else str(info.get("type"))
         emoji = TYPE_EMOJI.get(info.get("type"), "👤")
-        lines.append(f"{emoji} **{name}** — {label}")
+        esc_name = html.escape(name)
+        lines.append(f"{emoji} <b>{esc_name}</b> — {label}")
         traffic = traffics.get(name)
         if traffic:
             lines.append(f"   ↳ {traffic}")
@@ -251,7 +321,8 @@ async def screen_client(name: str) -> tuple[str, InlineKeyboardMarkup]:
     backend = BACKENDS.get(info.get("type"))
     label = backend.label if backend else str(info.get("type"))
     emoji = TYPE_EMOJI.get(info.get("type"), "👤")
-    lines = [f"{emoji} **{name}**", "", f"Тип: {label}"]
+    esc_name = html.escape(name)
+    lines = [f"{emoji} <b>{esc_name}</b>", "", f"Тип: {label}"]
     created = info.get("created")
     if created:
         lines.append(f"Создан: {fmt_created(created)}")
@@ -276,8 +347,9 @@ async def screen_client(name: str) -> tuple[str, InlineKeyboardMarkup]:
 
 
 def screen_delete(name: str) -> tuple[str, InlineKeyboardMarkup]:
+    esc_name = html.escape(name)
     text = (
-        f"🗑 Удалить клиента **{name}**?\n\n"
+        f"🗑 Удалить клиента <b>{esc_name}</b>?\n\n"
         "Доступ с его конфигами прекратится сразу."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -288,13 +360,14 @@ def screen_delete(name: str) -> tuple[str, InlineKeyboardMarkup]:
 
 
 def screen_type(name: str) -> tuple[str, InlineKeyboardMarkup]:
+    esc_name = html.escape(name)
     lines = [
-        "➕ **Новый клиент**", "",
-        f"Имя: `{name}`", "",
+        "➕ <b>Новый клиент</b>", "",
+        f"Имя: {code(name)}", "",
         "Выбери протокол:",
     ]
     for key, label in TYPES_MENU:
-        lines.append(f"{TYPE_EMOJI[key]} **{label}** — {TYPE_DESCRIPTIONS[key]}")
+        lines.append(f"{TYPE_EMOJI[key]} <b>{label}</b> — {TYPE_DESCRIPTIONS[key]}")
     rows = [[InlineKeyboardButton(
         text=f"{TYPE_EMOJI[key]} {label}", callback_data=f"t:{key}")]
         for key, label in TYPES_MENU]
@@ -322,12 +395,12 @@ async def screen_server() -> tuple[str, InlineKeyboardMarkup]:
         return "🟢" if ok else "🔴"
 
     text = (
-        "🖥 **Сервер**\n\n"
-        f"🌐 Адрес: `{host}`\n\n"
+        "🖥 <b>Сервер</b>\n\n"
+        f"🌐 Адрес: {code(host)}\n\n"
         f"{dot(x_ok)} VLESS + Reality — TCP {xport}\n"
         f"{dot(a_ok)} AmneziaWG — UDP {aport}\n"
         f"{dot(s_ok)} Shadowsocks — TCP/UDP {sport}\n\n"
-        "🔴 — смотри `journalctl -u <сервис> -n 30`"
+        f"🔴 — смотри {code('journalctl -u <сервис> -n 30')}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="srv:refresh")],
@@ -337,22 +410,23 @@ async def screen_server() -> tuple[str, InlineKeyboardMarkup]:
 
 
 HELP_TEXT = (
-    "❓ **Помощь**\n\n"
-    "**Экраны** (всё управление кнопками):\n"
+    "❓ <b>Помощь</b>\n\n"
+    "<b>Экраны</b> (всё управление кнопками):\n"
     "➕ Создать клиента → ввод имени → выбор протокола\n"
     "📋 Клиенты — список, карточка клиента, удаление\n"
     "🖥 Сервер — адрес и статус трёх VPN-сервисов\n\n"
-    "**Команды** (для быстрого доступа):\n"
-    "/create <имя> [awg|vless|ss] — создать\n"
-    "/get <имя> — сразу получить конфиг\n"
-    "/delete <имя> — удалить\n"
-    "/list — список\n"
-    "/cancel — прервать ввод\n\n"
-    "**Протоколы**\n"
+    "<b>Команды</b> (для быстрого доступа):\n"
+    f"{code('/create <имя> [awg|vless|ss]')} — создать\n"
+    f"{code('/get <имя>')} — сразу получить конфиг\n"
+    f"{code('/delete <имя>')} — удалить\n"
+    f"{code('/list')} — список\n"
+    f"{code('/cancel')} — прервать ввод\n\n"
+    "<b>Протоколы</b>\n"
     "🚀 VLESS + Reality — TCP 443, маскировка под TLS, самый устойчивый\n"
-    "🛡 AmneziaWG — UDP 443, обфускация AWG 2.0, `.conf` + QR\n"
-    "⚡ Shadowsocks 2022 — TCP/UDP 1443, `ss://` + QR\n\n"
-    "Все предыдущие сообщения чата удаляются при новом сообщении."
+    "🛡 AmneziaWG — UDP 443, обфускация AWG 2.0, .conf + QR\n"
+    "⚡ Shadowsocks 2022 — TCP/UDP 1443, ss:// + QR\n\n"
+    "Твои сообщения удаляются сразу после отправки, ответы бота — "
+    "через пару минут, экран с кнопками остаётся."
 )
 
 
@@ -378,22 +452,22 @@ async def deliver(chat_id: int, name: str) -> None:
         await bot.send_message(chat_id, result)
         return
 
-    header = f"**{name}** · {backend.label}"
+    header = f"<b>{html.escape(name)}</b> · {backend.label}"
     if result.link:
         await bot.send_message(
-            chat_id, f"{header}\n\n🔗 `{result.link}`", parse_mode="Markdown"
+            chat_id, f"{header}\n\n🔗 {code(result.link)}", parse_mode="HTML"
         )
     if result.conf:
         filename, data = result.conf
         await bot.send_document(
             chat_id, BufferedInputFile(data, filename=filename),
-            caption=header, parse_mode="Markdown",
+            caption=header, parse_mode="HTML",
         )
     if result.qr_text:
         await bot.send_photo(
             chat_id,
             BufferedInputFile(make_qr_png(result.qr_text), filename=f"{name}.png"),
-            caption=f"QR-код · **{name}**", parse_mode="Markdown",
+            caption=f"QR-код · <b>{html.escape(name)}</b>", parse_mode="HTML",
         )
 
 
@@ -440,7 +514,7 @@ class CreateFlow(StatesGroup):
 
 
 NAME_PROMPT = (
-    "➕ **Новый клиент**\n\n"
+    "➕ <b>Новый клиент</b>\n\n"
     "Введи имя (латиница, цифры, `-` и `_`, до 32 символов):"
 )
 
@@ -451,20 +525,20 @@ NAME_PROMPT = (
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     text, kb = await screen_main()
-    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer(HELP_TEXT, parse_mode="Markdown", reply_markup=menu_kb())
+    await message.answer(HELP_TEXT, parse_mode="HTML", reply_markup=menu_kb())
 
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
     text, kb = await screen_main()
-    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 @dp.message(Command("create"))
@@ -473,7 +547,7 @@ async def cmd_create(message: Message, command: CommandObject, state: FSMContext
     args = (command.args or "").split()
     if not args:
         await state.set_state(CreateFlow.waiting_name)
-        prompt = await message.answer(NAME_PROMPT, parse_mode="Markdown",
+        prompt = await message.answer(NAME_PROMPT, parse_mode="HTML",
                                       reply_markup=cancel_kb())
         await state.update_data(prompt_id=prompt.message_id)
         return
@@ -488,9 +562,9 @@ async def cmd_create(message: Message, command: CommandObject, state: FSMContext
         return
     if type_key not in BACKENDS:
         await message.answer(
-            f"Неизвестный тип VPN: `{type_key}`. Доступно: "
-            + ", ".join(f"`{k}`" for k in BACKENDS),
-            parse_mode="Markdown",
+            "Неизвестный тип VPN: "
+            f"{code(type_key)}. Доступно: {code(', '.join(BACKENDS))}",
+            parse_mode="HTML",
         )
         return
 
@@ -501,7 +575,7 @@ async def cmd_create(message: Message, command: CommandObject, state: FSMContext
     await deliver(message.chat.id, name)
     text, kb = await screen_client(name)
     await message.answer("✅ Клиент создан.\n\n" + text,
-                         parse_mode="Markdown", reply_markup=kb)
+                         parse_mode="HTML", reply_markup=kb)
 
 
 @dp.message(Command("get"))
@@ -509,7 +583,8 @@ async def cmd_get(message: Message, command: CommandObject, state: FSMContext):
     await state.clear()
     name = (command.args or "").strip()
     if not name:
-        await message.answer("Использование: `/get <имя>`", parse_mode="Markdown")
+        await message.answer(
+            f"Использование: {code('/get <имя>')}", parse_mode="HTML")
         return
     await deliver(message.chat.id, name)
 
@@ -519,7 +594,8 @@ async def cmd_delete(message: Message, command: CommandObject, state: FSMContext
     await state.clear()
     name = (command.args or "").strip()
     if not name:
-        await message.answer("Использование: `/delete <имя>`", parse_mode="Markdown")
+        await message.answer(
+            f"Использование: {code('/delete <имя>')}", parse_mode="HTML")
         return
     await message.answer(await delete_client(name), reply_markup=menu_kb())
 
@@ -528,7 +604,7 @@ async def cmd_delete(message: Message, command: CommandObject, state: FSMContext
 async def cmd_list(message: Message, state: FSMContext):
     await state.clear()
     text, kb = await screen_list(0)
-    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 # ---------- FSM-хендлеры ----------
@@ -556,12 +632,12 @@ async def create_name_entered(message: Message, state: FSMContext):
         try:
             await bot.edit_message_text(
                 text, chat_id=message.chat.id, message_id=prompt_id,
-                parse_mode="Markdown", reply_markup=kb,
+                parse_mode="HTML", reply_markup=kb,
             )
             return
         except TelegramBadRequest:
             pass
-    await message.answer(text, parse_mode="Markdown", reply_markup=kb)
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 
 @dp.message(StateFilter(CreateFlow.waiting_type))
@@ -581,42 +657,42 @@ async def process_callback(cq: CallbackQuery, state: FSMContext):
         if data == "m:menu":
             await state.clear()
             text, kb = await screen_main()
-            await safe_edit(cq.message, text, parse_mode="Markdown", reply_markup=kb)
+            await safe_edit(cq.message, text, parse_mode="HTML", reply_markup=kb)
 
         elif data == "m:create":
             await state.set_state(CreateFlow.waiting_name)
             prompt = await cq.message.edit_text(
-                NAME_PROMPT, parse_mode="Markdown", reply_markup=cancel_kb()
+                NAME_PROMPT, parse_mode="HTML", reply_markup=cancel_kb()
             )
             await state.update_data(prompt_id=prompt.message_id)
 
         elif data == "m:clients":
             await state.clear()
             text, kb = await screen_list(0)
-            await safe_edit(cq.message, text, parse_mode="Markdown", reply_markup=kb)
+            await safe_edit(cq.message, text, parse_mode="HTML", reply_markup=kb)
 
         elif data == "m:server" or data == "srv:refresh":
             await state.clear()
             text, kb = await screen_server()
-            await safe_edit(cq.message, text, parse_mode="Markdown", reply_markup=kb)
+            await safe_edit(cq.message, text, parse_mode="HTML", reply_markup=kb)
             toast = "Обновлено" if data == "srv:refresh" else None
 
         elif data == "m:help":
             await state.clear()
             await safe_edit(cq.message, HELP_TEXT,
-                            parse_mode="Markdown", reply_markup=menu_kb())
+                            parse_mode="HTML", reply_markup=menu_kb())
 
         elif data in ("m:cancel", "m:noop"):
             await state.clear()
             if data == "m:cancel":
                 text, kb = await screen_main()
                 await safe_edit(cq.message, text,
-                                parse_mode="Markdown", reply_markup=kb)
+                                parse_mode="HTML", reply_markup=kb)
 
         elif data.startswith("pg:"):
             await state.clear()
             text, kb = await screen_list(int(data[3:]))
-            await safe_edit(cq.message, text, parse_mode="Markdown", reply_markup=kb)
+            await safe_edit(cq.message, text, parse_mode="HTML", reply_markup=kb)
 
         elif data.startswith("t:"):
             type_key = data[2:]
@@ -626,7 +702,7 @@ async def process_callback(cq: CallbackQuery, state: FSMContext):
             if not name or type_key not in BACKENDS:
                 text, kb = await screen_main()
                 await safe_edit(cq.message, text,
-                                parse_mode="Markdown", reply_markup=kb)
+                                parse_mode="HTML", reply_markup=kb)
             else:
                 ok, err = await do_create(name, type_key)
                 if not ok:
@@ -635,12 +711,12 @@ async def process_callback(cq: CallbackQuery, state: FSMContext):
                     await deliver(chat_id, name)
                     text, kb = await screen_client(name)
                     await safe_edit(cq.message, "✅ Клиент создан.\n\n" + text,
-                                    parse_mode="Markdown", reply_markup=kb)
+                                    parse_mode="HTML", reply_markup=kb)
 
         elif data.startswith("c:"):
             await state.clear()
             text, kb = await screen_client(data[2:])
-            await safe_edit(cq.message, text, parse_mode="Markdown", reply_markup=kb)
+            await safe_edit(cq.message, text, parse_mode="HTML", reply_markup=kb)
 
         elif data.startswith("g:"):
             await deliver(chat_id, data[2:])
@@ -648,7 +724,7 @@ async def process_callback(cq: CallbackQuery, state: FSMContext):
 
         elif data.startswith("d:"):
             text, kb = screen_delete(data[2:])
-            await safe_edit(cq.message, text, parse_mode="Markdown", reply_markup=kb)
+            await safe_edit(cq.message, text, parse_mode="HTML", reply_markup=kb)
 
         elif data.startswith("dy:"):
             result = await delete_client(data[3:])
@@ -660,7 +736,7 @@ async def process_callback(cq: CallbackQuery, state: FSMContext):
 
         elif data.startswith("dn:"):
             text, kb = await screen_client(data[3:])
-            await safe_edit(cq.message, text, parse_mode="Markdown", reply_markup=kb)
+            await safe_edit(cq.message, text, parse_mode="HTML", reply_markup=kb)
 
     except TelegramBadRequest as exc:
         if "message is not modified" in str(exc).lower():
@@ -686,7 +762,7 @@ async def fallback(message: Message, state: FSMContext):
     text, kb = await screen_main()
     await message.answer(
         "Неизвестная команда — управляй кнопками.\n\n" + text,
-        parse_mode="Markdown", reply_markup=kb,
+        parse_mode="HTML", reply_markup=kb,
     )
 
 
