@@ -1,92 +1,112 @@
-# AmneziaWG Telegram Bot (single‑admin)
+# VPN Node — Telegram-бот управления VPN-клиентами
 
-Бот для управления клиентами AmneziaWG через `manage_amneziawg.sh`
-из установщика `bivlked/amneziawg-installer`.
-Отвечает **только** пользователю с ID из `ADMIN_USER_ID`.
+Однопользовательский бот для управления клиентами трёх VPN-протоколов
+на собственном сервере. Отвечает **только** пользователю с ID из
+`ADMIN_USER_ID`; остальные сообщения молча игнорируются.
 
-## Команды
+Поддерживаемые протоколы (выбираются при создании клиента):
 
-| Команда | Действие |
-|---|---|
-| `/create <имя>` | Создаёт клиента и отправляет `.conf`. Если клиент уже есть — сообщает об этом. |
-| `/delete <имя>` | Удаляет клиента. Если клиента нет — сообщает об этом. |
-| `/list` | Показывает список всех клиентов. |
+| Протокол | Что выдаёт бот | Клиенты |
+|---|---|---|
+| **AmneziaWG** | файл `.conf` + QR-код | AmneziaWG, Amnezia VPN |
+| **VLESS + Xray Reality** | ссылка `vless://` + QR | v2rayNG, NekoBox, FoXray, Streisand |
+| **Shadowsocks 2022** | ссылка `ss://` + QR | Shadowsocks, v2rayNG, NekoBox |
+
+Три протокола сосуществуют на одном сервере: VLESS занимает TCP-порт 443
+(выглядит как обычный TLS-трафик к реальному сайту — самый устойчивый к
+блокировкам вариант), AmneziaWG работает на UDP-порту 443 с обфускацией
+AWG 2.0, Shadowsocks — на TCP/UDP 1443. Если один протокол начинает
+блокироваться, клиенты переводятся на другой — всё выдаётся через бота.
+
+## Интерфейс бота
+
+Всё управление — через экраны с inline-кнопками (одно сообщение бота
+превращается в «приложение»):
+
+- **🏠 Меню** (`/start`) — адрес сервера, число клиентов, разделы.
+- **➕ Создать клиента** — ввод имени → выбор протокола с описаниями →
+  готовый клиент сразу получает конфиг/QR; экран переходит в карточку клиента.
+- **📋 Клиенты** — список с типом и трафиком, кнопки на клиенте; при больше
+  8 клиентов — пагинация ◀️ ▶️. Карточка клиента: тип, дата создания,
+  трафик, кнопки «Получить конфиг», «Удалить» (с подтверждением).
+- **🖥 Сервер** — адрес и статус (🟢/🔴) трёх VPN-сервисов, кнопка обновить.
+
+Текстовые команды для быстрого доступа: `/create <имя> [awg|vless|ss]`,
+`/get <имя>`, `/delete <имя>`, `/list`, `/cancel`.
+
+После каждого нового сообщения бот удаляет все предыдущие сообщения
+чата (и команды, и свои ответы) — переписка не накапливается.
 
 ## Требования
 
-- Установленный AmneziaWG через `bivlked/amneziawg-installer`
-- Python 3.10+
-- Права на запуск `manage_amneziawg.sh` (обычно root или sudo без пароля)
+- Чистый VPS с Debian 12+ / Ubuntu 22.04+ (amd64 или arm64), root-доступ
+- Python 3.10+ (для локальной разработки; на сервер deploy.sh ставит сам)
 
-## Установка
+## Установка на сервере (полная автоматика)
 
 ```bash
-git clone <repo> awg-telegram-bot
-cd awg-telegram-bot
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-# отредактируйте .env: BOT_TOKEN, ADMIN_USER_ID
+git clone <repo> vpn-node && cd vpn-node
+sudo ./deploy.sh                    # интерактивно спросит BOT_TOKEN и ADMIN_USER_ID
+# или неинтерактивно:
+sudo BOT_TOKEN=... ADMIN_USER_ID=... ./deploy.sh
 ```
 
-## Запуск вручную
+Скрипт полностью автоматически:
+
+1. Ставит системные зависимости (python3, venv, curl, openssl и т.д.).
+2. Устанавливает AmneziaWG из официального PPA (`amnezia/ppa`, ключ
+   сверен по fingerprint), при необходимости — заголовки ядра для DKMS.
+3. Создаёт серверный конфиг `/etc/amnezia/amneziawg/awg0.conf` со
+   случайными параметрами обфускации AWG 2.0 (Jc/Jmin/Jmax/S1–S4/H1–H4),
+   включает форвардинг и NAT.
+4. Устанавливает Xray-core и настраивает VLESS + Reality (TCP 443,
+   маскировка под домен `REALITY_SNI`, по умолчанию `dl.google.com`).
+5. Устанавливает shadowsocks-rust и настраивает сервер AEAD-2022
+   (`2022-blake3-aes-256-gcm`) на порту 1443.
+6. Открывает порты в ufw (если активен), пишет `/etc/awg-bot/server-params.json`.
+7. Копирует бота в `/opt/awg-telegram-bot`, готовит venv, `.env` (600),
+   создаёт и запускает systemd-сервис `awg-bot`.
+
+Запуск AmneziaWG осознанно оставлен ручным — выполните после установки:
 
 ```bash
+sudo systemctl restart awg-quick@awg0
+sudo systemctl status awg-quick@awg0 --no-pager
+```
+
+Удаление бота (VPN-сервисы не трогает): `sudo ./deploy.sh --uninstall`
+
+Переменные установщика: `BOT_TOKEN`, `ADMIN_USER_ID`, `PROXY_URL`,
+`VPN_HOST` (иначе IP определится автоматически), `AWG_PORT` (443),
+`XRAY_PORT` (443), `SS_PORT` (1443), `AWG_SUBNET` (10.8.0.1/24),
+`REALITY_SNI` (dl.google.com), `INSTALL_DIR`, `SERVICE_NAME`, `PYTHON_BIN`.
+
+## Смена IP-адреса сервера
+
+Если у сервера динамический IP, пропишите в `.env` **доменное имя**
+(`VPN_HOST=vpn.example.com`) и настройте DNS — клиенты переживут смену IP
+без перевыпуска конфигов. Если `VPN_HOST` пуст, бот определяет внешний IP
+сам при каждом запросе.
+
+## Локальная разработка
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env   # заполнить BOT_TOKEN и ADMIN_USER_ID
 python bot.py
 ```
 
-## Прокси (для локального тестирования)
-
-Если с машины, где запускается бот, нет прямого доступа к `api.telegram.org`,
-укажите в `.env`:
-
-```env
-PROXY_URL=socks5://127.0.0.1:1080
-```
-
-Поддерживаются **SOCKS5** и **HTTP** прокси.
-⚠️ **MTProto-прокси** (TeleConnect, tgproxy и т.п.) **не подходят** —
-aiogram использует Bot API (HTTPS), а не MTProto.
-
-Проще всего поднять SOCKS5 через SSH-туннель до зарубежного VPS:
-
-```bash
-ssh -D 1080 -N -f user@your-vps
-```
-
-## Запуск как systemd‑сервис (рекомендуется)
-
-Создайте `/etc/systemd/system/awg-bot.service`:
-
-```ini
-[Unit]
-Description=AmneziaWG Telegram Bot
-After=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/opt/awg-telegram-bot
-EnvironmentFile=/opt/awg-telegram-bot/.env
-ExecStart=/opt/awg-telegram-bot/venv/bin/python bot.py
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Затем:
-
-```bash
-systemctl daemon-reload
-systemctl enable --now awg-bot
-journalctl -u awg-bot -f
-```
+Пути к конфигам VPN-сервисов переопределяются переменными окружения
+(`AWG_CONF`, `XRAY_CONFIG`, `SS_CONFIG`, `SERVER_PARAMS`, `STATE_FILE`) —
+так можно тестировать бэкенды без установленных VPN-сервисов.
 
 ## Безопасность
 
-- Бот реагирует только на `ADMIN_USER_ID`, остальные сообщения молча игнорируются.
-- `.env` с токеном не должен попадать в Git (см. `.gitignore`).
-- Если бот работает не от root, настройте точечные `sudoers`-правила
-  для запуска `manage_amneziawg.sh`.
+- `.env` с токеном в `.gitignore`; деплой создаёт его с правами 600.
+- Бот молча игнорирует всех, кроме `ADMIN_USER_ID`.
+- Имена клиентов валидируются (`[A-Za-z0-9_-]`, до 32 символов).
+- Секреты клиентов (приватные ключи, пароли) хранятся только в
+  `/etc/awg-bot/state.json` (root, 600) и не логируются.
+- `/etc/awg-bot/server-params.json` (root, 600) — публичный ключ Reality
+  и параметры Shadowsocks, нужные боту для построения ссылок.

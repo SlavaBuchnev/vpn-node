@@ -3,5 +3,6 @@ config/
 *.log
 .idea
 venv/
+.venv/
 __pycache__/
 *.pyc
